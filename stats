@@ -1,0 +1,229 @@
+#!/usr/bin/env python
+#
+# Savvi Pipes(tm) (c) Jay Fenton 2015
+#
+# Re-implementation of SPL in Pandas for use with Unix Pipes
+
+import sys
+import os
+import csv
+import pandas as pd
+
+from StringIO import StringIO
+from pprint import pformat
+
+from pyparsing import *
+import numpy as np
+
+pd.set_option('display.max_rows', 500)
+pd.set_option('display.max_columns', 500)
+pd.set_option('display.width', 100000)
+pd.set_option('display.expand_frame_repr', False)
+
+method = os.path.basename(__file__)
+
+if method == 'head':
+	headn = 10
+	def headnparse(t):
+		global headn
+		headn = int(t[0]['headn'])
+
+	headn = Word(nums)
+	head = Literal('head')
+	headcmd = head + Group(headn('headn')).setParseAction(headnparse)
+
+	grammar = headcmd
+
+	args = method + ' '.join(sys.argv[1:])
+
+	try:
+		val = grammar.parseString(args)
+	except ParseException, pe:
+		print "Parsing failed:"
+		print args
+		print "%s^" % (' '*(pe.col-1))
+		print pe.msg
+		sys.exit(1)
+
+	df = pd.read_csv(sys.stdin, nrows=headn)
+	gb = df.head(n=headn)
+
+	# TODO: We should be renaming the dataframe so it propagates down the pipeline
+	header = ','.join(gb.columns.values)
+#	header = ''
+#	for field in gb.columns.values:
+#		col = '%s' % (field)
+#		header += col + ','
+#	header = header[:-1] # Remove trailing comma
+	print header
+
+	gb.to_csv(sys.stdout, header=False)
+
+elif method == 'eval':
+
+	spamreader = csv.reader(sys.stdin, delimiter=' ', quotechar='"')
+	for row in spamreader:
+		print ', '.join(row)
+
+elif method == 'stats':
+
+	# http://docs.splunk.com/Documentation/Splunk/6.2.3/SearchReference/CommonStatsFunctions
+	# Simple: stats (stats-function(field) [as field])+ [by field-list]
+	# Complete: stats [partitions=<num>] [allnum=<bool>] [delim=<string>] ( <stats-agg-term> | <sparkline-agg-term> ) [<by clause>]
+	# avg() | c() | count() | dc() | distinct_count() | earliest() | estdc() | estdc_error() | exactperc<int>() | first() | last() | latest() | list() | max() | median() | min() | mode() | p<in>() | perc<int>() | range() | stdev() | stdevp() | sum() | sumsq() | upperperc<int>() | values() | var() | varp()
+	#
+	# TODO: partitions=<num>
+	# TODO: allnum=<bool>
+	# TODO: delim=<string>
+
+	parsed_aggs_by_field = {}
+	aggfield_to_label = {}
+	parsed_bys = []
+
+	def aggfuncparse(t):
+		global parsed_aggs_by_field
+		aggfield = t[0]['aggfield']
+		aggfunc = t[0]['aggfunc']
+		if aggfield not in parsed_aggs_by_field: parsed_aggs_by_field[aggfield] = []
+		if 'as' in t[0]: aggfield_to_label['%s(%s)' % (aggfunc, aggfield)] = t[0]['as']
+		parsed_aggs_by_field[ t[0]['aggfield'] ].append(aggfunc)
+
+	def byparse(t):
+		global parsed_bys
+		parsed_bys.append(t[0]['by'])
+
+	LPAR = Literal('(').suppress()
+	RPAR = Literal(')').suppress()
+	field = Word(alphas + '_' + nums)
+	colname = Word(alphas + '_' + nums)
+	stats = Literal('stats')
+	as_ = Literal("as").suppress() + colname('as')
+	aggfuncwithoutpar = oneOf('count')
+	aggfuncwithoutarg = oneOf('avg c count dc distinct_count earliest estdc estdc_error first last latest list max median min mode range stdev stdevp sum sumsq upperperc values var varp')
+	aggfuncwitharg = Combine(oneOf('exactperc p perc') + Word(nums))
+	aggfunc = aggfuncwithoutarg | aggfuncwitharg
+	agg = Group(aggfunc('aggfunc') + LPAR + field('aggfield') + RPAR + Optional(as_) | aggfuncwithoutpar('aggfuncwithoutpar') + Optional(as_)).setParseAction(aggfuncparse)
+	aggs = delimitedList(agg, delim=',')
+	by = Group(field('by')).setParseAction(byparse)
+	bys = delimitedList(by, delim=',')
+	statscmd = stats + aggs + Group(Optional(Literal("by").suppress() + bys))
+
+	grammar = statscmd
+
+	args = method + ' '.join(sys.argv[1:])
+
+	try:
+		val = grammar.parseString(args)
+	except ParseException, pe:
+		print "Parsing failed:"
+		print args
+		print "%s^" % (' '*(pe.col-1))
+		print pe.msg
+		sys.exit(1)
+
+	all_fields_of_interest = parsed_aggs_by_field.keys()
+	if len(parsed_bys) > 0: all_fields_of_interest += parsed_bys
+
+	df = pd.read_csv(sys.stdin, usecols=all_fields_of_interest)
+
+#	all_fields = df.columns
+#	dif_fields = all_fields.difference(all_fields_of_interest)
+#	df.drop(dif_fields, inplace=True, axis=1)
+
+	gb = df
+
+#	gb = df[all_fields_of_interest]
+
+	if len(parsed_bys) > 0: gb = gb.groupby(parsed_bys)
+
+	def gen_quantile(args,field,func):
+		q = args
+		quantile_ = lambda x: np.percentile(x, float(q)/float(100))
+		quantile_.__name__ = func.replace('X','') + str(q)
+		return quantile_
+
+	def gen_range(args,field,func):
+		range_ = lambda x: np.max(x) - np.min(x) # TODO: Broken!?!?! Returns 0.. I think this needs to be a transform
+		range_.__name__ = 'range'
+		return range_
+
+	spl2pandas = {
+		'avg':			'mean',
+		'c':			'count',
+		'count':		'count',
+		'dc':			'nunique',
+		'distinct_count':	'nunique',
+		'earliest':		None,
+		'estdc':		'nunique',
+		'estdc_error':		None,
+		'exactpercXX':		gen_quantile,
+		'first':		'first',
+		'last':			'last',
+		'latest':		None,			# TODO: Requires temporal sort
+		'list':			None,			# TODO: Requires equivalent to MV fields
+		'max':			'max',			
+		'median':		'median',
+		'min':			'min',
+		'mode':			'mode',
+		'pXX':			gen_quantile,
+		'percXX':		gen_quantile,
+		'per_day':		None,			# TODO: Requires temporal
+		'per_hour':		None,			# TODO: Requires temporal
+		'per_minute':		None,			# TODO: Requires temporal
+		'per_second':		None,			# TODO: Requires temporal
+		'range':		gen_range,
+		'stdev':		'std',
+		'stdevp':		'std',			# TODO: 'This function returns the population standard deviation of the field X.'
+		'sum':			'sum',
+		'sumsq':		None,			# TODO: Find equivalent
+		'upperpercXX':		gen_quantile,
+		'values':		'values',		# TODO: Requires equivalent to MV fields
+		'var':			'var',
+		'varp':			'varp'			# TODO: http://unlikenoise.com/exploring-variance-standard-deviation/
+	}
+
+	# TODO: There's a whole bunch of additional pandas agg functions that SPL doesn't have :)
+	# gb.agg        gb.boxplot    gb.cummin     gb.describe   gb.filter     gb.get_group  gb.height     gb.last       gb.median     gb.ngroups    gb.plot       gb.rank       gb.std        gb.transform
+	# gb.aggregate  gb.count      gb.cumprod    gb.dtype      gb.first      gb.groups     gb.hist       gb.max        gb.min        gb.nth        gb.prod       gb.resample   gb.sum        gb.var
+	# gb.apply      gb.cummax     gb.cumsum     gb.fillna     gb.gender     gb.head       gb.indices    gb.mean       gb.name       gb.ohlc       gb.quantile   gb.size       gb.tail       gb.weight
+
+	def spl2pandasfunc(func):
+		digits = ''.join([s for s in func if s.isdigit()])
+		func = ''.join([s for s in func if not s.isdigit()])
+		if digits != '':
+			func += 'X'*len(digits)
+			digits = int(digits)
+		else:
+			digits = None
+		if func not in spl2pandas:
+			return func
+		elif hasattr(spl2pandas[func], '__call__'):
+			return spl2pandas[func](digits,field,func)
+		else:
+			return spl2pandas[func]
+
+	aggfuncs_list = []
+	aggdict = {}
+	for field,funcs in parsed_aggs_by_field.items():
+		# TODO: Probably want to parse out e.g. range here and exec tranforms after the agg (or we implement range directly in pandas)
+		aggdict[field] = map(spl2pandasfunc, funcs)
+
+	if len(parsed_bys) > 0:
+		gb = gb.agg(aggdict)
+	else:
+		gb = gb.apply(aggdict) # TODO: We need a way to apply agg's without groupby..
+
+	# TODO: We should be renaming the dataframe cols so it propagates down the pipeline
+	header = ''
+	if len(parsed_bys) > 0: header += ','.join(parsed_bys) + ','
+	for aggfunc,aggfield in gb.columns.values:
+		col = '%s(%s)' % (aggfield,aggfunc)
+		if col in aggfield_to_label:
+			header += aggfield_to_label[col] + ','
+		else:
+			header += col + ','
+	header = header[:-1] # Remove trailing comma
+	print header
+
+	gb.to_csv(sys.stdout, header=False)
+
